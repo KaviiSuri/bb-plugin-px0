@@ -1,225 +1,312 @@
-// bb-plugin-px0 — a BB plugin backend entry.
-//
-// The default export is a factory that receives the plugin API. BB supplies
-// the tiny defineRpcContract runtime helper; the API type remains type-only.
-//
-// The example is a todo list. One store in bb.storage.kv serves three
-// surfaces: the Example todos page (app.tsx, over RPC), the `bb px0` CLI
-// command (below), and the skill in skills/example-todos/SKILL.md that tells
-// agents how to use that command. A write from any surface publishes a realtime signal so
-// every open page refetches.
-import { randomUUID } from "node:crypto";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
+import { hostContract, type Px0Server } from "./contract";
 
-const todoSchema = z.object({
-  id: z.string(),
-  title: z.string(),
-  done: z.boolean(),
-  createdAt: z.string(),
-});
-export type Todo = z.infer<typeof todoSchema>;
+const unavailableSchema = z
+  .object({
+    status: z.literal("unavailable"),
+    message: z.string(),
+  })
+  .strict();
 
-// Both schemas run at the wire boundary. Handler input/output are inferred
-// from the shared contract; app.tsx imports only its type.
+const openResultSchema = z.discriminatedUnion("status", [
+  z
+    .object({
+      status: z.literal("ready"),
+      path: z.string(),
+      localUrl: z.string().url(),
+      shareUrl: z.string().url().nullable(),
+    })
+    .strict(),
+  unavailableSchema,
+]);
+
+export type OpenForThreadResult = z.infer<typeof openResultSchema>;
+
+const stopResultSchema = z.discriminatedUnion("status", [
+  z
+    .object({
+      status: z.literal("ready"),
+      path: z.string(),
+      stopped: z.boolean(),
+    })
+    .strict(),
+  unavailableSchema,
+]);
+
 export const rpcContract = defineRpcContract({
-  todos_list: {
-    input: z.null(),
-    output: z.object({ todos: z.array(todoSchema) }),
+  open_for_thread: {
+    input: z.object({ threadId: z.string().min(1) }).strict(),
+    output: openResultSchema,
   },
-  todos_add: {
-    input: z.object({ title: z.string().trim().min(1).max(200) }),
-    output: todoSchema,
-  },
-  todos_set_done: {
-    input: z.object({ id: z.string(), done: z.boolean() }),
-    output: todoSchema,
-  },
-  todos_remove: {
-    input: z.object({ id: z.string() }),
-    output: z.object({ removed: z.boolean() }),
+  stop_for_thread: {
+    input: z.object({ threadId: z.string().min(1) }).strict(),
+    output: stopResultSchema,
   },
 });
 
-/** Realtime channel app.tsx listens on; the payload is the todo count. */
-const TODOS_CHANGED = "todos-changed";
+interface ThreadLocation {
+  hostId: string;
+  path: string;
+}
+
+type ThreadLocationResult =
+  | { status: "ready"; location: ThreadLocation }
+  | { status: "unavailable"; message: string };
 
 export default async function plugin(bb: BbPluginApi) {
   bb.log.info("loaded");
 
-  // Declarative settings — rendered in BB's settings UI and editable with
-  // `bb plugin config px0`. Add `secret: true` for values like API keys.
-  // Settings are read once per load: reload the plugin after changing one.
   const settings = bb.settings.define({
-    showDone: {
+    binaryPath: {
+      type: "string",
+      label: "px0 binary path",
+      default: "",
+    },
+    readOnly: {
       type: "boolean",
-      label: "Show completed todos",
+      label: "Disable px0 editing",
       default: true,
     },
   });
-  const { showDone } = await settings.get();
 
-  // Namespaced key-value storage in bb.db (JSON values, up to 256KB each).
-  // For bigger or relational data use bb.storage.database().
-  async function readTodos(): Promise<Todo[]> {
-    return (await bb.storage.kv.get<Todo[]>("todos")) ?? [];
-  }
-  async function writeTodos(todos: Todo[]): Promise<void> {
-    await bb.storage.kv.set("todos", todos);
-    // Ephemeral broadcast to every connected client; nothing is persisted.
-    bb.realtime.publish(TODOS_CHANGED, { count: todos.length });
-  }
+  // Creating the client is load-safe. Calls are made only from RPC and CLI
+  // handlers, after this plugin generation has become active.
+  const host = bb.hosts.experimental_client({ contract: hostContract });
 
-  async function listTodos(): Promise<Todo[]> {
-    const todos = await readTodos();
-    return showDone ? todos : todos.filter((todo) => !todo.done);
-  }
-  async function addTodo(title: string): Promise<Todo> {
-    const todo: Todo = {
-      id: randomUUID().slice(0, 8),
-      title,
-      done: false,
-      createdAt: new Date().toISOString(),
+  const activePorts = new Map<string, Set<number>>();
+  const serversByPath = new Map<string, Map<string, number>>();
+
+  async function resolveThreadLocation(
+    threadId: string,
+    signal?: AbortSignal,
+  ): Promise<ThreadLocationResult> {
+    const thread = await bb.sdk.threads.get({ threadId, signal });
+    if (thread.environmentId === null) {
+      return {
+        status: "unavailable",
+        message: "This thread does not have a working directory yet.",
+      };
+    }
+    const environment = await bb.sdk.environments.get({
+      environmentId: thread.environmentId,
+      signal,
+    });
+    if (environment.path === null) {
+      return {
+        status: "unavailable",
+        message: "This thread's working directory is still being prepared.",
+      };
+    }
+
+    return {
+      status: "ready",
+      location: {
+        hostId: environment.hostId,
+        path: environment.path,
+      },
     };
-    await writeTodos([...(await readTodos()), todo]);
-    return todo;
   }
-  async function setTodoDone(id: string, done: boolean): Promise<Todo | null> {
-    const todos = await readTodos();
-    const todo = todos.find((candidate) => candidate.id === id);
-    if (todo === undefined) return null;
-    todo.done = done;
-    await writeTodos(todos);
-    return todo;
+
+  function rememberServer(hostId: string, server: Px0Server): void {
+    let ports = activePorts.get(hostId);
+    if (ports === undefined) {
+      ports = new Set<number>();
+      activePorts.set(hostId, ports);
+    }
+    let paths = serversByPath.get(hostId);
+    if (paths === undefined) {
+      paths = new Map<string, number>();
+      serversByPath.set(hostId, paths);
+    }
+    const previousPort = paths.get(server.path);
+    if (previousPort !== undefined && previousPort !== server.port) {
+      ports.delete(previousPort);
+    }
+    ports.add(server.port);
+    paths.set(server.path, server.port);
   }
-  async function removeTodo(id: string): Promise<boolean> {
-    const todos = await readTodos();
-    const remaining = todos.filter((todo) => todo.id !== id);
-    if (remaining.length === todos.length) return false;
-    await writeTodos(remaining);
-    return true;
+
+  function forgetServer(hostId: string, path: string): void {
+    const paths = serversByPath.get(hostId);
+    const port = paths?.get(path);
+    if (port === undefined) return;
+
+    paths?.delete(path);
+    activePorts.get(hostId)?.delete(port);
+    if (paths?.size === 0) serversByPath.delete(hostId);
+    if (activePorts.get(hostId)?.size === 0) activePorts.delete(hostId);
+  }
+
+  function replaceServers(hostId: string, servers: Px0Server[]): void {
+    activePorts.set(hostId, new Set(servers.map((server) => server.port)));
+    serversByPath.set(
+      hostId,
+      new Map(servers.map((server) => [server.path, server.port])),
+    );
+  }
+
+  function declareActivePorts(hostId: string): void {
+    bb.hosts.declareSharedPorts(hostId, [
+      ...(activePorts.get(hostId) ?? new Set<number>()),
+    ]);
+  }
+
+  async function shareUrlFor(
+    hostId: string,
+    port: number,
+  ): Promise<string | null> {
+    try {
+      declareActivePorts(hostId);
+      const { label, baseDomain } =
+        await bb.hosts.ensureSharedPortTunnel(hostId);
+      return `https://${label}--${port}.${baseDomain}`;
+    } catch (cause) {
+      bb.log.debug(
+        `px0 sharing unavailable for host ${hostId}: ${cause instanceof Error ? cause.message : String(cause)}`,
+      );
+      return null;
+    }
+  }
+
+  async function redeclareAfterStop(hostId: string): Promise<void> {
+    try {
+      declareActivePorts(hostId);
+    } catch (cause) {
+      bb.log.debug(
+        `could not update px0 shared ports for host ${hostId}: ${cause instanceof Error ? cause.message : String(cause)}`,
+      );
+    }
+  }
+
+  async function openForThread(threadId: string, signal?: AbortSignal) {
+    const resolved = await resolveThreadLocation(threadId, signal);
+    if (resolved.status === "unavailable") return resolved;
+
+    const { hostId, path } = resolved.location;
+    const { binaryPath, readOnly } = await settings.get();
+    const server = await host.call(
+      "ensure",
+      { path, binaryPath, readOnly },
+      { hostId, signal },
+    );
+    rememberServer(hostId, server);
+
+    return {
+      status: "ready" as const,
+      path,
+      localUrl: `http://127.0.0.1:${server.port}`,
+      shareUrl: await shareUrlFor(hostId, server.port),
+    };
+  }
+
+  async function stopForThread(threadId: string, signal?: AbortSignal) {
+    const resolved = await resolveThreadLocation(threadId, signal);
+    if (resolved.status === "unavailable") return resolved;
+
+    const { hostId, path } = resolved.location;
+    const { servers } = await host.call("list", null, { hostId, signal });
+    replaceServers(hostId, servers);
+    const { stopped } = await host.call("stop", { path }, { hostId, signal });
+    if (stopped) forgetServer(hostId, path);
+    await redeclareAfterStop(hostId);
+    return { status: "ready" as const, path, stopped };
   }
 
   bb.rpc.register(rpcContract, {
-    todos_list: async () => ({ todos: await listTodos() }),
-    todos_add: ({ title }) => addTodo(title),
-    todos_set_done: async ({ id, done }) => {
-      const todo = await setTodoDone(id, done);
-      if (todo === null) throw new Error(`No todo with id ${id}`);
-      return todo;
-    },
-    todos_remove: async ({ id }) => ({ removed: await removeTodo(id) }),
+    open_for_thread: ({ threadId }) => openForThread(threadId),
+    stop_for_thread: ({ threadId }) => stopForThread(threadId),
   });
 
-  // The `bb px0` command: what agents (and you) use from a shell. Parsing
-  // argv is plugin-owned; `commands` is metadata BB renders into help and
-  // the generated plugin-commands skill without running plugin code.
   const usage = [
     "Usage:",
-    "  bb px0 list [--json]",
-    "  bb px0 add <title> [--json]",
-    "  bb px0 done <todo-id> [--json]",
-    "  bb px0 undo <todo-id> [--json]",
-    "  bb px0 remove <todo-id> [--json]",
+    "  bb px0 list [thread-id] [--json]",
+    "  bb px0 stop [thread-id] [--json]",
+    "",
+    "When thread-id is omitted, the command uses the current BB thread.",
   ].join("\n");
-  function formatTodo(todo: Todo): string {
-    return `[${todo.done ? "x" : " "}] ${todo.id}  ${todo.title}`;
-  }
+
   bb.cli.register({
     name: "px0",
-    summary: "Manage the Px0 plugin's example todo list",
+    summary: "Inspect and stop px0 code navigators",
     commands: [
-      { name: "list", summary: "List todos", usage: "bb px0 list [--json]" },
       {
-        name: "add",
-        summary: "Add a todo",
-        usage: "bb px0 add <title> [--json]",
+        name: "list",
+        summary: "List px0 navigators on a thread's host",
+        usage: "bb px0 list [thread-id] [--json]",
       },
       {
-        name: "done",
-        summary: "Mark a todo done",
-        usage: "bb px0 done <todo-id> [--json]",
-      },
-      {
-        name: "undo",
-        summary: "Mark a todo not done",
-        usage: "bb px0 undo <todo-id> [--json]",
-      },
-      {
-        name: "remove",
-        summary: "Remove a todo",
-        usage: "bb px0 remove <todo-id> [--json]",
+        name: "stop",
+        summary: "Stop the px0 navigator for a thread",
+        usage: "bb px0 stop [thread-id] [--json]",
       },
     ],
-    async run(argv) {
+    async run(argv, context) {
       const json = argv.includes("--json");
-      const [command, ...args] = argv.filter((arg) => arg !== "--json");
-      const reply = (value: unknown, text: string) => ({
-        exitCode: 0,
-        stdout: json ? JSON.stringify(value) : text,
-      });
-      const notFound = (missingId: string) => ({
-        exitCode: 1,
-        stderr: `No todo with id ${missingId}. Run "bb px0 list" to see ids.`,
-      });
-      const todoId = args[0];
-      switch (command) {
-        case undefined:
-        case "help":
-        case "--help":
-          return { exitCode: 0, stdout: usage };
-        case "list": {
-          const todos = await listTodos();
-          return reply(
-            todos,
-            todos.length === 0 ? "No todos." : todos.map(formatTodo).join("\n"),
-          );
-        }
-        case "add": {
-          const title = args.join(" ").trim();
-          if (title === "") break;
-          const todo = await addTodo(title);
-          return reply(todo, `Added ${formatTodo(todo)}`);
-        }
-        case "done":
-        case "undo": {
-          if (todoId === undefined || args.length !== 1) break;
-          const todo = await setTodoDone(todoId, command === "done");
-          if (todo === null) return notFound(todoId);
-          return reply(todo, formatTodo(todo));
-        }
-        case "remove": {
-          if (todoId === undefined || args.length !== 1) break;
-          if (!(await removeTodo(todoId))) return notFound(todoId);
-          return reply({ removed: true, id: todoId }, `Removed ${todoId}`);
-        }
+      const positional = argv.filter((argument) => argument !== "--json");
+      const [command, explicitThreadId, ...extra] = positional;
+      if (extra.length > 0) return { exitCode: 1, stderr: usage };
+      if (command === undefined || command === "help" || command === "--help") {
+        return { exitCode: 0, stdout: usage };
       }
+
+      const threadId = explicitThreadId ?? context.threadId;
+      if (threadId === undefined) {
+        return {
+          exitCode: 1,
+          stderr: "No BB thread is active. Pass a thread id explicitly.",
+        };
+      }
+
+      if (command === "list") {
+        const resolved = await resolveThreadLocation(threadId, context.signal);
+        if (resolved.status === "unavailable") {
+          return { exitCode: 1, stderr: resolved.message };
+        }
+        const { hostId } = resolved.location;
+        const { servers } = await host.call("list", null, {
+          hostId,
+          signal: context.signal,
+        });
+        replaceServers(hostId, servers);
+        await redeclareAfterStop(hostId);
+        return {
+          exitCode: 0,
+          stdout: json
+            ? JSON.stringify({ hostId, servers })
+            : servers.length === 0
+              ? "No px0 navigators are running on this host."
+              : servers
+                  .map(
+                    (server) =>
+                      `${server.path}\n  http://127.0.0.1:${server.port}  ${server.readOnly ? "read-only" : "editing enabled"}`,
+                  )
+                  .join("\n"),
+        };
+      }
+
+      if (command === "stop") {
+        const result = await stopForThread(threadId, context.signal);
+        if (result.status === "unavailable") {
+          return { exitCode: 1, stderr: result.message };
+        }
+        return {
+          exitCode: 0,
+          stdout: json
+            ? JSON.stringify(result)
+            : result.stopped
+              ? `Stopped px0 for ${result.path}.`
+              : `No px0 navigator is running for ${result.path}.`,
+        };
+      }
+
       return { exitCode: 1, stderr: usage };
     },
   });
 
-  // Cleanup on reload/disable/shutdown; hooks run LIFO. The sanctioned place
-  // to clear timers and close connections.
   bb.onDispose(() => {
+    activePorts.clear();
+    serversByPath.clear();
     bb.log.info("disposed");
   });
-
-  // Long-lived background work: starts after load, gets an AbortSignal on
-  // reload/disable/shutdown, and restarts with backoff if it crashes. Sleeps
-  // must wake on abort — a plain setTimeout sleeps through the stop window
-  // and the plugin reports "degraded (service did not stop)" on reload.
-  // bb.background.service("worker", {
-  //   async start(signal) {
-  //     while (!signal.aborted) {
-  //       await new Promise((resolve) => {
-  //         const timer = setTimeout(resolve, 60_000);
-  //         signal.addEventListener(
-  //           "abort",
-  //           () => { clearTimeout(timer); resolve(undefined); },
-  //           { once: true },
-  //         );
-  //       });
-  //     }
-  //   },
-  // });
 }

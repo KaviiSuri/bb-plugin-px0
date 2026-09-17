@@ -8,11 +8,6 @@ px0 is a local web server, so BB can host it in a panel: the plugin starts
 the conversation. Launched with `-no-agent`, so it navigates and reads rather
 than edits.
 
-## Status
-
-Scaffold plus the host process manager. The server entry and the UI surfaces
-are not written yet — see "Design" for the intended shape.
-
 ## Design
 
 Three entries, because BB separates trust levels:
@@ -40,9 +35,9 @@ Three constraints shaped this file:
 
 ### `server.ts` — resolution and brokering
 
-Resolves a thread to a directory — `threads.get` gives `environmentId` and
-`environmentHostId`, `environments.get` gives the workspace `path` — then calls
-the host entry on that specific host and returns a URL.
+Resolves a thread to a directory: `threads.get` gives `environmentId`, then
+`environments.get` gives the workspace `path` and its `hostId`. It calls the
+host entry on that specific host and returns a URL.
 
 For clients that are not on the workspace machine (phone, web), it can wrap the
 port with `bb.hosts.declareSharedPorts` plus `ensureSharedPortTunnel` and return
