@@ -75,7 +75,11 @@ export default async function plugin(bb: BbPluginApi) {
   const host = bb.hosts.experimental_client({ contract: hostContract });
 
   const activePorts = new Map<string, Set<number>>();
-  const serversByPath = new Map<string, Map<string, number>>();
+  const serversBySession = new Map<string, Map<string, number>>();
+
+  function serverSessionKey(server: Px0Server): string {
+    return `${server.threadId ?? "read-only"}\0${server.path}`;
+  }
 
   async function resolveThreadLocation(
     threadId: string,
@@ -114,35 +118,27 @@ export default async function plugin(bb: BbPluginApi) {
       ports = new Set<number>();
       activePorts.set(hostId, ports);
     }
-    let paths = serversByPath.get(hostId);
-    if (paths === undefined) {
-      paths = new Map<string, number>();
-      serversByPath.set(hostId, paths);
+    let sessions = serversBySession.get(hostId);
+    if (sessions === undefined) {
+      sessions = new Map<string, number>();
+      serversBySession.set(hostId, sessions);
     }
-    const previousPort = paths.get(server.path);
+    const key = serverSessionKey(server);
+    const previousPort = sessions.get(key);
     if (previousPort !== undefined && previousPort !== server.port) {
       ports.delete(previousPort);
     }
     ports.add(server.port);
-    paths.set(server.path, server.port);
-  }
-
-  function forgetServer(hostId: string, path: string): void {
-    const paths = serversByPath.get(hostId);
-    const port = paths?.get(path);
-    if (port === undefined) return;
-
-    paths?.delete(path);
-    activePorts.get(hostId)?.delete(port);
-    if (paths?.size === 0) serversByPath.delete(hostId);
-    if (activePorts.get(hostId)?.size === 0) activePorts.delete(hostId);
+    sessions.set(key, server.port);
   }
 
   function replaceServers(hostId: string, servers: Px0Server[]): void {
     activePorts.set(hostId, new Set(servers.map((server) => server.port)));
-    serversByPath.set(
+    serversBySession.set(
       hostId,
-      new Map(servers.map((server) => [server.path, server.port])),
+      new Map(
+        servers.map((server) => [serverSessionKey(server), server.port]),
+      ),
     );
   }
 
@@ -187,7 +183,7 @@ export default async function plugin(bb: BbPluginApi) {
     const { binaryPath, readOnly } = await settings.get();
     const server = await host.call(
       "ensure",
-      { path, binaryPath, readOnly },
+      { path, binaryPath, readOnly, threadId },
       { hostId, signal },
     );
     rememberServer(hostId, server);
@@ -205,12 +201,72 @@ export default async function plugin(bb: BbPluginApi) {
     if (resolved.status === "unavailable") return resolved;
 
     const { hostId, path } = resolved.location;
+    const { stopped } = await host.call(
+      "stop",
+      { path, threadId },
+      { hostId, signal },
+    );
     const { servers } = await host.call("list", null, { hostId, signal });
     replaceServers(hostId, servers);
-    const { stopped } = await host.call("stop", { path }, { hostId, signal });
-    if (stopped) forgetServer(hostId, path);
     await redeclareAfterStop(hostId);
     return { status: "ready" as const, path, stopped };
+  }
+
+  async function runAgentForThread(
+    threadId: string,
+    prompt: string,
+    cwd: string | undefined,
+    signal: AbortSignal | undefined,
+  ) {
+    const resolved = await resolveThreadLocation(threadId, signal);
+    if (resolved.status === "unavailable") {
+      throw new Error(resolved.message);
+    }
+    if (cwd !== undefined && cwd !== resolved.location.path) {
+      throw new Error(
+        `px0 is running in ${cwd}, but thread ${threadId} uses ${resolved.location.path}.`,
+      );
+    }
+
+    const thread = await bb.sdk.threads.get({ threadId, signal });
+    if (thread.status !== "idle") {
+      throw new Error(
+        `Thread ${threadId} is ${thread.status}. Wait for its current turn to finish, then retry the px0 edit.`,
+      );
+    }
+
+    let dispatched = false;
+    try {
+      await bb.sdk.threads.send({
+        threadId,
+        mode: "start",
+        input: [{ type: "text", text: prompt, mentions: [] }],
+      });
+      dispatched = true;
+
+      const completed = await bb.sdk.threads.wait({
+        threadId,
+        status: "idle",
+        timeoutMs: 9 * 60 * 1_000,
+        signal,
+      });
+      if (!completed.matched) {
+        throw new Error(`Timed out waiting for BB thread ${threadId}.`);
+      }
+      const output = await bb.sdk.threads.output({ threadId, signal });
+      return output.output?.trim() || "BB completed the px0 edit.";
+    } catch (cause) {
+      if (dispatched) {
+        try {
+          await bb.sdk.threads.stop({ threadId });
+        } catch (stopCause) {
+          bb.log.warn(
+            `could not stop BB thread ${threadId} after a px0 agent failure: ${stopCause instanceof Error ? stopCause.message : String(stopCause)}`,
+          );
+        }
+      }
+      throw cause;
+    }
   }
 
   bb.rpc.register(rpcContract, {
@@ -242,6 +298,37 @@ export default async function plugin(bb: BbPluginApi) {
       },
     ],
     async run(argv, context) {
+      if (argv[0] === "agent-run") {
+        const [, threadId, prompt, ...extra] = argv;
+        if (
+          threadId === undefined ||
+          prompt === undefined ||
+          prompt.trim() === "" ||
+          extra.length > 0
+        ) {
+          return {
+            exitCode: 1,
+            stderr: "Invalid internal px0 agent invocation.",
+          };
+        }
+        try {
+          return {
+            exitCode: 0,
+            stdout: await runAgentForThread(
+              threadId,
+              prompt,
+              context.cwd,
+              context.signal,
+            ),
+          };
+        } catch (cause) {
+          return {
+            exitCode: 1,
+            stderr: cause instanceof Error ? cause.message : String(cause),
+          };
+        }
+      }
+
       const json = argv.includes("--json");
       const positional = argv.filter((argument) => argument !== "--json");
       const [command, explicitThreadId, ...extra] = positional;
@@ -279,7 +366,7 @@ export default async function plugin(bb: BbPluginApi) {
               : servers
                   .map(
                     (server) =>
-                      `${server.path}\n  http://127.0.0.1:${server.port}  ${server.readOnly ? "read-only" : "editing enabled"}`,
+                      `${server.path}\n  http://127.0.0.1:${server.port}  ${server.readOnly ? "read-only, shared" : `edits route to ${server.threadId}`}`,
                   )
                   .join("\n"),
         };
@@ -306,7 +393,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.onDispose(() => {
     activePorts.clear();
-    serversByPath.clear();
+    serversBySession.clear();
     bb.log.info("disposed");
   });
 }

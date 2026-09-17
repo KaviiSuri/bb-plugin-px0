@@ -4,13 +4,18 @@
 // necessarily the machine running the BB server). This is the only place
 // allowed to spawn processes, so px0 lives here.
 //
-// One px0 process per absolute directory, reused across threads and reloads of
-// the panel. The worker holds a retain lease while any child is alive so BB's
-// five-minute idle eviction does not kill the servers out from under an open
-// panel.
+// Read-only px0 processes are shared by directory. Editable processes are
+// scoped to a BB thread so their custom agent command always talks back to the
+// panel's originating conversation. The worker holds a retain lease while any
+// child is alive so BB's five-minute idle eviction does not kill the servers.
 import { spawn, type ChildProcess } from "node:child_process";
 import { accessSync, constants } from "node:fs";
-import { createServer } from "node:net";
+import {
+  createServer as createHttpServer,
+  request as httpRequest,
+  type Server as HttpServer,
+} from "node:http";
+import { createServer as createNetServer } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
@@ -19,10 +24,11 @@ import { hostContract, type Px0Server } from "./contract";
 interface Entry {
   server: Px0Server;
   child: ChildProcess;
+  adapter: HttpServer | null;
   ready: Promise<void>;
 }
 
-/** path → running px0. Module state is fine: one worker per plugin per host. */
+/** session key → running px0. Module state is fine: one worker per plugin per host. */
 const entries = new Map<string, Entry>();
 
 /** Keeps the worker (and therefore the children) alive while servers run. */
@@ -51,10 +57,16 @@ function resolveBinary(configured: string): string {
   return "px0";
 }
 
+function entryKey(path: string, threadId: string | null): string {
+  return threadId === null
+    ? `read-only\0${path}`
+    : `editable\0${threadId}\0${path}`;
+}
+
 /** Ask the OS for a free loopback port, then hand it straight to px0. */
 function pickPort(): Promise<number> {
   return new Promise((resolve, reject) => {
-    const probe = createServer();
+    const probe = createNetServer();
     probe.unref();
     probe.on("error", reject);
     probe.listen(0, "127.0.0.1", () => {
@@ -66,6 +78,145 @@ function pickPort(): Promise<number> {
       }
       const { port } = address;
       probe.close(() => resolve(port));
+    });
+  });
+}
+
+async function pickDifferentPort(excluded: number): Promise<number> {
+  let port = await pickPort();
+  while (port === excluded) port = await pickPort();
+  return port;
+}
+
+/**
+ * px0 0.1.5 runs custom command templates, but its UI only opens the composer
+ * when the selected harness also appears in the built-in detection list. Add
+ * the pinned custom `bb` harness to the two metadata responses the UI reads.
+ */
+function exposePinnedCustomHarness(body: Buffer): Buffer {
+  try {
+    const value = JSON.parse(body.toString()) as {
+      agent?: unknown;
+      agentPinned?: unknown;
+      agents?: unknown;
+      selected?: unknown;
+      pinned?: unknown;
+      harnesses?: unknown;
+    };
+    const selected =
+      typeof value.selected === "string"
+        ? value.selected
+        : typeof value.agent === "string"
+          ? value.agent
+          : "";
+    const pinned = value.pinned === true || value.agentPinned === true;
+    const key = Array.isArray(value.harnesses) ? "harnesses" : "agents";
+    const harnesses = value[key];
+    if (
+      pinned &&
+      selected !== "" &&
+      Array.isArray(harnesses) &&
+      !harnesses.some(
+        (harness) =>
+          typeof harness === "object" &&
+          harness !== null &&
+          "name" in harness &&
+          harness.name === selected,
+      )
+    ) {
+      value[key] = [
+        {
+          name: selected,
+          cmd: "BB thread",
+          installed: true,
+          models: [],
+          model: "",
+        },
+        ...harnesses,
+      ];
+    }
+    return Buffer.from(JSON.stringify(value));
+  } catch {
+    return body;
+  }
+}
+
+function startAgentUiAdapter(
+  publicPort: number,
+  upstreamPort: number,
+): Promise<HttpServer> {
+  return new Promise((resolve, reject) => {
+    const server = createHttpServer((request, response) => {
+      const pathname = new URL(
+        request.url ?? "/",
+        "http://127.0.0.1",
+      ).pathname;
+      const patchMetadata =
+        pathname === "/api/meta" ||
+        pathname === "/api/agent/harnesses";
+      const headers = {
+        ...request.headers,
+        host: `127.0.0.1:${upstreamPort}`,
+      };
+      if (patchMetadata) headers["accept-encoding"] = "identity";
+      const agentMutation =
+        request.method === "POST" && pathname.startsWith("/api/agent/");
+      if (agentMutation) {
+        let originHost = "";
+        try {
+          originHost = new URL(request.headers.origin ?? "").host;
+        } catch {
+          // Rejected below with the same deliberately vague message as px0.
+        }
+        if (originHost === "" || originHost !== request.headers.host) {
+          response.writeHead(403, { "content-type": "text/plain" });
+          response.end("request did not come from px0");
+          return;
+        }
+        headers.origin = `http://127.0.0.1:${upstreamPort}`;
+      }
+      const upstream = httpRequest(
+        {
+          hostname: "127.0.0.1",
+          port: upstreamPort,
+          path: request.url,
+          method: request.method,
+          headers,
+        },
+        (upstreamResponse) => {
+          if (!patchMetadata) {
+            response.writeHead(
+              upstreamResponse.statusCode ?? 502,
+              upstreamResponse.headers,
+            );
+            upstreamResponse.pipe(response);
+            return;
+          }
+
+          const chunks: Buffer[] = [];
+          upstreamResponse.on("data", (chunk: Buffer) => chunks.push(chunk));
+          upstreamResponse.on("end", () => {
+            const body = exposePinnedCustomHarness(Buffer.concat(chunks));
+            const headers = { ...upstreamResponse.headers };
+            delete headers["content-length"];
+            headers["content-length"] = String(body.byteLength);
+            response.writeHead(upstreamResponse.statusCode ?? 502, headers);
+            response.end(body);
+          });
+        },
+      );
+      upstream.on("error", (cause) => {
+        if (!response.headersSent) {
+          response.writeHead(502, { "content-type": "text/plain" });
+        }
+        response.end(`Could not reach px0: ${cause.message}`);
+      });
+      request.pipe(upstream);
+    });
+    server.once("error", reject);
+    server.listen(publicPort, "127.0.0.1", () => {
+      server.off("error", reject);
+      resolve(server);
     });
   });
 }
@@ -94,10 +245,11 @@ async function waitUntilServing(
   throw new Error(`px0 did not start serving on port ${port} within 20s.`);
 }
 
-function stopEntry(path: string): boolean {
-  const entry = entries.get(path);
+function stopEntry(key: string): boolean {
+  const entry = entries.get(key);
   if (entry === undefined) return false;
-  entries.delete(path);
+  entries.delete(key);
+  entry.adapter?.close();
   entry.child.kill("SIGTERM");
   const child = entry.child;
   setTimeout(() => {
@@ -111,31 +263,36 @@ function stopEntry(path: string): boolean {
 }
 
 function stopAll(): void {
-  for (const path of [...entries.keys()]) stopEntry(path);
+  for (const key of [...entries.keys()]) stopEntry(key);
 }
 
 export default experimental_defineHostEntry({
   contract: hostContract,
   handlers: {
-    ensure: async ({ path, readOnly, binaryPath }, context) => {
-      const existing = entries.get(path);
-      if (existing !== undefined && existing.server.readOnly === readOnly) {
+    ensure: async ({ path, readOnly, threadId, binaryPath }, context) => {
+      const sessionThreadId = readOnly ? null : threadId;
+      const key = entryKey(path, sessionThreadId);
+      const existing = entries.get(key);
+      if (existing !== undefined) {
         // Surface a start failure to this caller too, not just the first one.
         await existing.ready;
         return existing.server;
       }
-      // A read-only/editable flip needs a fresh process.
-      if (existing !== undefined) stopEntry(path);
 
       const binary = resolveBinary(binaryPath);
-      const port = await pickPort();
+      const upstreamPort = await pickPort();
+      const port = readOnly
+        ? upstreamPort
+        : await pickDifferentPort(upstreamPort);
       const args = [
         "-no-open",
         "-no-telemetry",
         "-quiet",
         "-port",
-        String(port),
-        ...(readOnly ? ["-no-agent"] : []),
+        String(upstreamPort),
+        ...(readOnly
+          ? ["-no-agent"]
+          : ["-agent", `bb px0 agent-run ${threadId} {prompt}`]),
         path,
       ];
       const child = spawn(binary, args, {
@@ -153,23 +310,35 @@ export default experimental_defineHostEntry({
         path,
         port,
         readOnly,
+        threadId: sessionThreadId,
         startedAt: Date.now(),
       };
-      const ready = waitUntilServing(port, child, context.signal).catch(
-        (cause: unknown) => {
-          entries.delete(path);
-          child.kill("SIGKILL");
-          const detail = stderr.trim();
-          throw new Error(
-            `${cause instanceof Error ? cause.message : String(cause)}` +
-              (detail === "" ? "" : `\n${detail}`),
-          );
-        },
-      );
-      entries.set(path, { server, child, ready });
+      let adapter: HttpServer | null = null;
+      const ready = waitUntilServing(upstreamPort, child, context.signal)
+        .then(async () => {
+          if (!readOnly) {
+            adapter = await startAgentUiAdapter(port, upstreamPort);
+            const entry = entries.get(key);
+            if (entry !== undefined) entry.adapter = adapter;
+          }
+        })
+        .catch(
+          (cause: unknown) => {
+            entries.delete(key);
+            adapter?.close();
+            child.kill("SIGKILL");
+            const detail = stderr.trim();
+            throw new Error(
+              `${cause instanceof Error ? cause.message : String(cause)}` +
+                (detail === "" ? "" : `\n${detail}`),
+            );
+          },
+        );
+      entries.set(key, { server, child, adapter, ready });
 
       child.once("exit", () => {
-        if (entries.get(path)?.child === child) entries.delete(path);
+        adapter?.close();
+        if (entries.get(key)?.child === child) entries.delete(key);
         if (entries.size === 0) {
           lease?.dispose();
           lease = null;
@@ -186,7 +355,18 @@ export default experimental_defineHostEntry({
       return server;
     },
 
-    stop: async ({ path }) => ({ stopped: stopEntry(path) }),
+    stop: async ({ path, threadId }) => {
+      let stopped = false;
+      for (const [key, entry] of [...entries]) {
+        if (
+          entry.server.path === path &&
+          (entry.server.readOnly || entry.server.threadId === threadId)
+        ) {
+          stopped = stopEntry(key) || stopped;
+        }
+      }
+      return { stopped };
+    },
 
     list: async () => ({
       servers: [...entries.values()].map((entry) => entry.server),

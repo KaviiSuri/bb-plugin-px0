@@ -5,8 +5,9 @@ code navigator, without leaving the thread.
 
 px0 is a local web server, so BB can host it in a panel: the plugin starts
 `px0` on the thread's workspace directory and renders it in an iframe beside
-the conversation. Launched with `-no-agent`, so it navigates and reads rather
-than edits.
+the conversation. It is read-only by default. When editing is enabled, px0
+sends its file-and-line-aware edit prompt back to the BB thread that opened the
+panel, and BB performs the edit.
 
 ## Design
 
@@ -16,8 +17,10 @@ Three entries, because BB separates trust levels:
 
 Full-trust Node on the machine that owns the workspace, which is not
 necessarily the machine running the BB server. The only entry allowed to spawn
-processes, so px0 lives here. It keeps one px0 per absolute directory in a
-`Map`, so two threads on the same worktree share a process.
+processes, so px0 lives here. Read-only panels keep one px0 per absolute
+directory, so two threads on the same worktree share a process. Editable
+panels use one process per directory and BB thread because px0 0.1.5 does not
+identify the browser client that submitted an edit.
 
 Three constraints shaped this file:
 
@@ -44,6 +47,20 @@ port with `bb.hosts.declareSharedPorts` plus `ensureSharedPortTunnel` and return
 an `https://` share URL, falling back to loopback when the machine is not
 enrolled in BB Connect.
 
+It also owns the `bb px0 agent-run` bridge used by editable px0 sessions. The
+bridge sends px0's prompt to the originating thread, waits for that turn to
+finish, and returns its output to px0. If the thread is already running, the
+bridge refuses the edit instead of steering or silently queueing it.
+
+px0 0.1.5 can execute a custom agent command but omits custom commands from
+the UI's detected-harness list, leaving its pinned composer inaccessible. For
+editable sessions only, the host places a loopback adapter in front of px0
+that adds the pinned `bb` command to px0's two agent-metadata responses. It
+also verifies the browser's origin before rebasing agent POSTs onto px0's
+internal loopback origin; non-agent traffic streams through unchanged. This
+compatibility adapter can go away when px0 exposes pinned custom commands in
+its UI.
+
 ### `app.tsx` — the surfaces
 
 A `threadPanelAction` with `layout: "flush"` rendering the iframe, and an
@@ -51,9 +68,10 @@ A `threadPanelAction` with `layout: "flush"` rendering the iframe, and an
 
 ## Notes
 
-`-no-agent` removes px0's editing affordance. It is not a hardened read-only
-sandbox — it is a local server the iframe can talk to. That is fine for your
-own machine and worth knowing before it points anywhere else.
+The default `readOnly` setting launches px0 with `-no-agent`. Turning it off
+pins px0's custom agent command to BB; px0's built-in coding agents are not
+used. Enable it with `bb plugin config px0 set readOnly false`. Read-only mode
+is not a hardened sandbox. px0 remains a local server the iframe can talk to.
 
 ## Development
 
