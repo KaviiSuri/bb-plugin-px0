@@ -1,0 +1,12 @@
+{
+  "sdkMajor": 0,
+  "sdkVersion": "0.4.34",
+  "artifactFormatVersion": 1,
+  "pluginId": "px0",
+  "pluginVersion": "0.1.0",
+  "builtWith": {
+    "bbVersion": "0.41.0",
+    "pluginSdkVersion": "0.4.34"
+  },
+  "artifactDigest": "4562538593a0fbb6e9e75b2f4be23e0a39c8230fcf5b8cfd8a17cefa938ab61b"
+}
