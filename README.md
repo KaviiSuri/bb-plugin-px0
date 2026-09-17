@@ -75,12 +75,50 @@ is not a hardened sandbox. px0 remains a local server the iframe can talk to.
 
 ## Development
 
-```
-npm install
-bb plugin build .      # dist/{server,host,app}.js
-npx tsc --noEmit
+```sh
+npm ci
+npm run check
 bb plugin install .
-bb plugin dev          # rebuild and reload on save
+bb plugin dev
+```
+
+## Install
+
+Install the latest compatible tagged release:
+
+```sh
+bb plugin install git:https://github.com/KaviiSuri/bb-plugin-px0.git@^0.1.0
+```
+
+Use `@main` only to test unreleased changes.
+
+## Releasing
+
+Releases are immutable annotated `vX.Y.Z` tags. Each release commit contains
+the matching package manifest, lockfile, and freshly built `dist/` artifacts.
+CI runs `npm run check` on pushes and pull requests to `main`.
+
+Cut a local release without publishing it:
+
+```sh
+npm run release -- patch
+npm run release -- minor
+npm run release -- 1.4.2
+```
+
+Add `--push` to atomically publish the release commit and tag. The first
+release may use the current package version when its tag does not exist:
+
+```sh
+npm run release -- 0.1.0 --push
+```
+
+The GitHub **Release** workflow offers the same version choices and creates
+GitHub release notes after publishing the tag. Never move a published tag;
+release a new patch version instead.
+
+```sh
+gh workflow run release.yml -f bump=patch
 ```
 
 ## License
