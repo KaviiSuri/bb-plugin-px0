@@ -1,9 +1,11 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   definePluginApp,
   useBbNavigate,
   useRpc,
+  type PluginFileOpenerProps,
 } from "@get-bb/plugin-sdk/app";
+import { FILE_EXTENSIONS, workspaceFilePath } from "./lib/file-navigation";
 import type { OpenForThreadResult, rpcContract } from "./server";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
@@ -37,7 +39,51 @@ function PanelMessage({
   );
 }
 
-function Px0Panel({ threadId }: { threadId: string }) {
+function Px0FileFrame({ url, path, lineRange }: {
+  url: string;
+  path: string;
+  lineRange: PluginFileOpenerProps["experimental_lineRange"];
+}) {
+  const iframe = useRef<HTMLIFrameElement>(null);
+  const ready = useRef(false);
+  const target = useRef({ path, line: lineRange?.startLineNumber });
+  const [src] = useState(() => {
+    const initial = new URL(url);
+    initial.searchParams.set("path", path);
+    if (lineRange) initial.searchParams.set("line", String(lineRange.startLineNumber));
+    return initial.href;
+  });
+  useEffect(() => {
+    target.current = { path, line: lineRange?.startLineNumber };
+    if (ready.current) iframe.current?.contentWindow?.postMessage(
+      { type: "bb-px0-open-file", ...target.current }, new URL(url).origin,
+    );
+  }, [path, lineRange, url]);
+  useEffect(() => {
+    const origin = new URL(url).origin;
+    function receive(event: MessageEvent) {
+      if (event.origin !== origin || event.source !== iframe.current?.contentWindow ||
+          event.data?.type !== "bb-px0-ready") return;
+      ready.current = true;
+      iframe.current?.contentWindow?.postMessage(
+        { type: "bb-px0-open-file", ...target.current }, origin,
+      );
+    }
+    window.addEventListener("message", receive);
+    return () => window.removeEventListener("message", receive);
+  }, [url]);
+  return <iframe ref={iframe} className="h-full min-h-0 w-full border-0 bg-background"
+    src={src} title={`px0: ${path}`} />;
+}
+
+function Px0FileOpener(props: PluginFileOpenerProps) {
+  if (!props.source.threadId || props.source.kind === "thread-storage") {
+    return <props.Original />;
+  }
+  return <Px0Panel threadId={props.source.threadId} file={props} />;
+}
+
+function Px0Panel({ threadId, file }: { threadId: string; file?: PluginFileOpenerProps }) {
   const rpc = useRpc<typeof rpcContract>();
   const [state, setState] = useState<PanelState>({ status: "loading" });
 
@@ -78,8 +124,12 @@ function Px0Panel({ threadId }: { threadId: string }) {
   }
 
   if (state.status === "unavailable") {
+    if (file) return <file.Original />;
     return <PanelMessage>{state.message}</PanelMessage>;
   }
+
+  const filePath = file ? workspaceFilePath(file.path, file.source, state) : null;
+  if (file && filePath === null) return <file.Original />;
 
   const isLocal =
     window.location.hostname === "localhost" ||
@@ -94,6 +144,11 @@ function Px0Panel({ threadId }: { threadId: string }) {
         panel.
       </PanelMessage>
     );
+  }
+
+  if (file && filePath !== null) {
+    return <Px0FileFrame key={`${url}\0${state.path}`} url={url} path={filePath}
+      lineRange={file.experimental_lineRange} />;
   }
 
   return (
@@ -131,6 +186,12 @@ function Px0HeaderAction({
 }
 
 export default definePluginApp((app) => {
+  app.slots.fileOpener({
+    id: "px0-files",
+    title: "px0",
+    extensions: FILE_EXTENSIONS,
+    component: Px0FileOpener,
+  });
   app.slots.experimental_tab({
     context: { kind: "thread" },
     availability: "action",

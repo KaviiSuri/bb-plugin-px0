@@ -71,6 +71,25 @@ its UI. The framing adapter is still required while px0 forbids embedding.
 An action-available thread `experimental_tab` with `layout: "flush"` rendering the iframe, and an
 `experimental_threadHeaderAction` button that opens it.
 
+A `fileOpener` also opens workspace file links from agent messages directly in
+px0, including their requested line. It registers common code, document, data,
+and image extensions. BB chooses the default opener per extension; if another
+viewer is pinned, choose px0 under Settings → File openers or right-click the
+link and choose Open with → px0. The SDK does not support wildcard extensions,
+so extensionless files continue to use BB's preview.
+
+File links start with the right inspector closed. In panels narrower than
+900 pixels, the file tree also starts hidden so the editor has room. These
+startup defaults do not override panes opened manually afterward. px0's
+controls and Cmd/Ctrl+J and Cmd/Ctrl+B can reopen the inspector and file tree.
+
+Files outside the thread's workspace, thread-storage files, and links without
+a thread use BB's preview. Git snapshots and deleted files remain handled by
+BB. The loopback adapter adds a parent-message navigation bridge to px0
+0.1.20's browser bundle so subsequent line requests preserve open editor state
+and unsaved edits. Messages are accepted only from the embedding BB parent,
+with the same allowed origins as the framing policy.
+
 ## Notes
 
 BB 0.47.1 and px0 0.1.20 or newer are required. The default `readOnly` setting keeps its
@@ -88,10 +107,14 @@ the workspace, and its native editor writes files directly.
 ```sh
 npm ci
 npm run check
+bun test app.test.tsx file-navigation.test.ts
 bun test host.test.ts # integration tests require px0 0.1.20+ on this host
 bb plugin install .
 bb plugin dev
 ```
+
+The optional real-browser navigation regression uses an external Playwright
+installation: `bun scripts/verify-links.ts /path/to/playwright/index.mjs`.
 
 ## Install
 

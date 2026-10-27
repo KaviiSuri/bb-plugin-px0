@@ -14,6 +14,8 @@ const openResultSchema = z.discriminatedUnion("status", [
     .object({
       status: z.literal("ready"),
       path: z.string(),
+      environmentId: z.string(),
+      hostId: z.string(),
       localUrl: z.string().url(),
       shareUrl: z.string().url().nullable(),
     })
@@ -48,6 +50,7 @@ export const rpcContract = defineRpcContract({
 interface ThreadLocation {
   hostId: string;
   path: string;
+  environmentId: string;
 }
 
 type ThreadLocationResult =
@@ -108,6 +111,7 @@ export default async function plugin(bb: BbPluginApi) {
       location: {
         hostId: environment.hostId,
         path: environment.path,
+        environmentId: thread.environmentId,
       },
     };
   }
@@ -195,6 +199,8 @@ export default async function plugin(bb: BbPluginApi) {
       status: "ready" as const,
       path,
       localUrl: `http://127.0.0.1:${server.port}`,
+      environmentId: resolved.location.environmentId,
+      hostId,
       shareUrl: await shareUrlFor(hostId, server.port),
     };
   }

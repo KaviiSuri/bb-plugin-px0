@@ -20,6 +20,7 @@ import { createServer as createNetServer } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
+import { addNavigationBridge } from "./lib/navigation-bridge";
 import { hostContract, type Px0Server } from "./contract";
 
 interface Entry {
@@ -209,11 +210,16 @@ function startAgentUiAdapter(
         !agentDisabled &&
         (pathname === "/api/meta" ||
           pathname === "/api/agent/harnesses");
+      const patchNavigation = pathname === "/static/app.js";
       const headers = {
         ...request.headers,
         host: `127.0.0.1:${upstreamPort}`,
       };
-      if (patchMetadata) headers["accept-encoding"] = "identity";
+      if (patchMetadata || patchNavigation) headers["accept-encoding"] = "identity";
+      if (patchNavigation) {
+        delete headers["if-none-match"];
+        delete headers["if-modified-since"];
+      }
       const agentMutation =
         request.method === "POST" && pathname.startsWith("/api/agent/");
       if (agentMutation) {
@@ -257,7 +263,7 @@ function startAgentUiAdapter(
             framePolicy,
           ].join(";");
           delete upstreamResponse.headers["x-frame-options"];
-          if (!patchMetadata) {
+          if (!patchMetadata && !patchNavigation) {
             response.writeHead(
               upstreamResponse.statusCode ?? 502,
               upstreamResponse.headers,
@@ -269,8 +275,16 @@ function startAgentUiAdapter(
           const chunks: Buffer[] = [];
           upstreamResponse.on("data", (chunk: Buffer) => chunks.push(chunk));
           upstreamResponse.on("end", () => {
-            const body = exposePinnedCustomHarness(Buffer.concat(chunks));
+            const original = Buffer.concat(chunks);
+            const body = patchNavigation
+              ? addNavigationBridge(original, frameOrigin)
+              : exposePinnedCustomHarness(original);
             const headers = { ...upstreamResponse.headers };
+            if (patchNavigation) {
+              delete headers.etag;
+              delete headers["last-modified"];
+              headers["cache-control"] = "no-store";
+            }
             delete headers["content-length"];
             headers["content-length"] = String(body.byteLength);
             response.writeHead(upstreamResponse.statusCode ?? 502, headers);

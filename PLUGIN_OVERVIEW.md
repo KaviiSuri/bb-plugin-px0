@@ -4,6 +4,8 @@ Open px0 beside any BB conversation and work against that thread's real workspac
 
 Browse the file tree, search the workspace, inspect symbols and references, review Git diffs, and use px0's native editor for quick changes. Direct editing includes file and folder creation, in-buffer find, word wrap, diagnostics, and automatic Git, search, and language-server refresh after saving.
 
+Click a workspace file link in an agent message to open that file in px0 at the requested line. Common code, document, data, and image extensions are registered with BB's file opener system. If another viewer is pinned for an extension, select px0 in Settings → File openers or use the link's Open with menu. Files outside the workspace and thread-storage artifacts use BB's preview.
+
 Two threads on the same working directory share one px0 process unless the optional BB agent bridge is enabled.
 
 ## BB agent bridge
