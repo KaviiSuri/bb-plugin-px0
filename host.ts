@@ -4,11 +4,12 @@
 // necessarily the machine running the BB server). This is the only place
 // allowed to spawn processes, so px0 lives here.
 //
-// Read-only px0 processes are shared by directory. Editable processes are
-// scoped to a BB thread so their custom agent command always talks back to the
-// panel's originating conversation. The worker holds a retain lease while any
-// child is alive so BB's five-minute idle eviction does not kill the servers.
-import { spawn, type ChildProcess } from "node:child_process";
+// Processes without BB agent integration are shared by directory. Agent-
+// bridged processes are scoped to a BB thread so their custom command always
+// talks back to the panel's originating conversation. Direct browser editing
+// is available in either mode. The worker holds a retain lease while any child
+// is alive so BB's five-minute idle eviction does not kill the servers.
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { accessSync, constants } from "node:fs";
 import {
   createServer as createHttpServer,
@@ -40,6 +41,9 @@ const BINARY_CANDIDATES = [
   "/usr/local/bin/px0",
 ];
 
+const MINIMUM_PX0_VERSION = [0, 1, 20] as const;
+const versionChecks = new Map<string, Promise<string>>();
+
 function resolveBinary(configured: string): string {
   const candidates =
     configured.trim() === ""
@@ -57,10 +61,58 @@ function resolveBinary(configured: string): string {
   return "px0";
 }
 
+function parseVersion(output: string): { text: string; parts: number[] } {
+  const match = output.match(/\bpx0\s+v?(\d+)\.(\d+)\.(\d+)\b/i);
+  if (match === null) {
+    throw new Error(`Could not read the px0 version from: ${output.trim()}`);
+  }
+  return {
+    text: `${match[1]}.${match[2]}.${match[3]}`,
+    parts: match.slice(1, 4).map(Number),
+  };
+}
+
+function isSupportedVersion(parts: number[]): boolean {
+  for (let index = 0; index < MINIMUM_PX0_VERSION.length; index += 1) {
+    const actual = parts[index] ?? 0;
+    const minimum = MINIMUM_PX0_VERSION[index];
+    if (actual !== minimum) return actual > minimum;
+  }
+  return true;
+}
+
+function checkVersion(binary: string): Promise<string> {
+  const existing = versionChecks.get(binary);
+  if (existing !== undefined) return existing;
+
+  const check = new Promise<string>((resolve, reject) => {
+    execFile(binary, ["-version"], { timeout: 5_000 }, (cause, stdout) => {
+      if (cause !== null) {
+        reject(new Error(`Could not run ${binary} -version: ${cause.message}`));
+        return;
+      }
+      try {
+        const version = parseVersion(stdout);
+        if (!isSupportedVersion(version.parts)) {
+          throw new Error(
+            `px0 ${version.text} is too old. Update px0 to 0.1.20 or newer with \`${binary} -update\`.`,
+          );
+        }
+        resolve(version.text);
+      } catch (versionCause) {
+        reject(versionCause);
+      }
+    });
+  });
+  versionChecks.set(binary, check);
+  check.catch(() => versionChecks.delete(binary));
+  return check;
+}
+
 function entryKey(path: string, threadId: string | null): string {
   return threadId === null
-    ? `read-only\0${path}`
-    : `editable\0${threadId}\0${path}`;
+    ? `agent-disabled\0${path}`
+    : `bb-agent\0${threadId}\0${path}`;
 }
 
 /** Ask the OS for a free loopback port, then hand it straight to px0. */
@@ -89,7 +141,7 @@ async function pickDifferentPort(excluded: number): Promise<number> {
 }
 
 /**
- * px0 0.1.5 runs custom command templates, but its UI only opens the composer
+ * px0 0.1.20 runs custom command templates, but its UI only opens the composer
  * when the selected harness also appears in the built-in detection list. Add
  * the pinned custom `bb` harness to the two metadata responses the UI reads.
  */
@@ -269,8 +321,8 @@ function stopAll(): void {
 export default experimental_defineHostEntry({
   contract: hostContract,
   handlers: {
-    ensure: async ({ path, readOnly, threadId, binaryPath }, context) => {
-      const sessionThreadId = readOnly ? null : threadId;
+    ensure: async ({ path, agentDisabled, threadId, binaryPath }, context) => {
+      const sessionThreadId = agentDisabled ? null : threadId;
       const key = entryKey(path, sessionThreadId);
       const existing = entries.get(key);
       if (existing !== undefined) {
@@ -280,17 +332,19 @@ export default experimental_defineHostEntry({
       }
 
       const binary = resolveBinary(binaryPath);
+      const px0Version = await checkVersion(binary);
       const upstreamPort = await pickPort();
-      const port = readOnly
+      const port = agentDisabled
         ? upstreamPort
         : await pickDifferentPort(upstreamPort);
       const args = [
         "-no-open",
+        "-no-update",
         "-no-telemetry",
         "-quiet",
         "-port",
         String(upstreamPort),
-        ...(readOnly
+        ...(agentDisabled
           ? ["-no-agent"]
           : ["-agent", `bb px0 agent-run ${threadId} {prompt}`]),
         path,
@@ -309,14 +363,15 @@ export default experimental_defineHostEntry({
       const server: Px0Server = {
         path,
         port,
-        readOnly,
+        agentDisabled,
         threadId: sessionThreadId,
+        px0Version,
         startedAt: Date.now(),
       };
       let adapter: HttpServer | null = null;
       const ready = waitUntilServing(upstreamPort, child, context.signal)
         .then(async () => {
-          if (!readOnly) {
+          if (!agentDisabled) {
             adapter = await startAgentUiAdapter(port, upstreamPort);
             const entry = entries.get(key);
             if (entry !== undefined) entry.adapter = adapter;
@@ -360,7 +415,7 @@ export default experimental_defineHostEntry({
       for (const [key, entry] of [...entries]) {
         if (
           entry.server.path === path &&
-          (entry.server.readOnly || entry.server.threadId === threadId)
+          (entry.server.agentDisabled || entry.server.threadId === threadId)
         ) {
           stopped = stopEntry(key) || stopped;
         }

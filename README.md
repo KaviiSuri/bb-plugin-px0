@@ -1,13 +1,14 @@
 # bb-plugin-px0
 
-Browse a BB thread's working directory in an embedded [px0](https://px0.ai)
-code navigator, without leaving the thread.
+Review and directly edit a BB thread's working directory in an embedded
+[px0](https://px0.ai) workspace, without leaving the thread.
 
 px0 is a local web server, so BB can host it in a panel: the plugin starts
 `px0` on the thread's workspace directory and renders it in an iframe beside
-the conversation. It is read-only by default. When editing is enabled, px0
-sends its file-and-line-aware edit prompt back to the BB thread that opened the
-panel, and BB performs the edit.
+the conversation. px0's native editor handles small file changes in the
+browser. Its coding-harness actions are disabled by default. When that opt-in
+is enabled, px0 sends file-and-line-aware agent prompts back to the BB thread
+that opened the panel.
 
 ## Design
 
@@ -17,10 +18,10 @@ Three entries, because BB separates trust levels:
 
 Full-trust Node on the machine that owns the workspace, which is not
 necessarily the machine running the BB server. The only entry allowed to spawn
-processes, so px0 lives here. Read-only panels keep one px0 per absolute
-directory, so two threads on the same worktree share a process. Editable
-panels use one process per directory and BB thread because px0 0.1.5 does not
-identify the browser client that submitted an edit.
+processes, so px0 lives here. Agent-disabled panels keep one px0 per absolute
+directory, so two threads on the same worktree share a process. Panels with
+the BB agent bridge enabled use one process per directory and BB thread because
+px0 does not identify the browser client that submitted an agent prompt.
 
 Three constraints shaped this file:
 
@@ -52,7 +53,7 @@ bridge sends px0's prompt to the originating thread, waits for that turn to
 finish, and returns its output to px0. If the thread is already running, the
 bridge refuses the edit instead of steering or silently queueing it.
 
-px0 0.1.5 can execute a custom agent command but omits custom commands from
+px0 0.1.20 can execute a custom agent command but omits custom commands from
 the UI's detected-harness list, leaving its pinned composer inaccessible. For
 editable sessions only, the host places a loopback adapter in front of px0
 that adds the pinned `bb` command to px0's two agent-metadata responses. It
@@ -68,10 +69,15 @@ A `threadPanelAction` with `layout: "flush"` rendering the iframe, and an
 
 ## Notes
 
-The default `readOnly` setting launches px0 with `-no-agent`. Turning it off
-pins px0's custom agent command to BB; px0's built-in coding agents are not
-used. Enable it with `bb plugin config px0 set readOnly false`. Read-only mode
-is not a hardened sandbox. px0 remains a local server the iframe can talk to.
+px0 0.1.20 or newer is required. The default `readOnly` setting keeps its
+historical key but now means "disable BB agent integration." It launches px0
+with `-no-agent`, which still leaves px0's native file editor, file creation,
+Git review, and staging controls available. Turning the setting off pins px0's
+custom agent command to BB; px0's built-in coding agents are not used. Enable
+it with `bb plugin config px0 set readOnly false`.
+
+Neither mode is a hardened sandbox. px0 is a local server with write access to
+the workspace, and its native editor writes files directly.
 
 ## Development
 
@@ -83,6 +89,12 @@ bb plugin dev
 ```
 
 ## Install
+
+Install or update px0 first:
+
+```sh
+px0 -update
+```
 
 Install the latest compatible tagged release:
 

@@ -8,7 +8,7 @@
   },
   "bb": {
     "name": "px0",
-    "description": "Browse a thread's working directory in an embedded px0 code navigator.",
+    "description": "Review and directly edit a thread's working directory in an embedded px0 workspace.",
     "branding": {
       "icon": "FolderOpen"
     },
@@ -31,7 +31,7 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
-    "@get-bb/plugin-sdk": "0.4.34",
+    "@get-bb/plugin-sdk": "0.6.49",
     "@pierre/diffs": "^1.2.9",
     "@radix-ui/react-alert-dialog": "^1.1.19",
     "@radix-ui/react-context-menu": "^2.3.3",

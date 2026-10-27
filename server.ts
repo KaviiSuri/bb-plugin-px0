@@ -65,7 +65,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
     readOnly: {
       type: "boolean",
-      label: "Disable px0 editing",
+      label: "Disable BB agent integration",
       default: true,
     },
   });
@@ -180,10 +180,10 @@ export default async function plugin(bb: BbPluginApi) {
     if (resolved.status === "unavailable") return resolved;
 
     const { hostId, path } = resolved.location;
-    const { binaryPath, readOnly } = await settings.get();
+    const { binaryPath, readOnly: agentDisabled } = await settings.get();
     const server = await host.call(
       "ensure",
-      { path, binaryPath, readOnly, threadId },
+      { path, binaryPath, agentDisabled, threadId },
       { hostId, signal },
     );
     rememberServer(hostId, server);
@@ -366,7 +366,7 @@ export default async function plugin(bb: BbPluginApi) {
               : servers
                   .map(
                     (server) =>
-                      `${server.path}\n  http://127.0.0.1:${server.port}  ${server.readOnly ? "read-only, shared" : `edits route to ${server.threadId}`}`,
+                      `${server.path}\n  http://127.0.0.1:${server.port}  px0 ${server.px0Version}, ${server.agentDisabled ? "direct edit, shared" : `BB agent bridge to ${server.threadId}`}`,
                   )
                   .join("\n"),
         };

@@ -9,10 +9,12 @@ const serverSchema = z.object({
   path: z.string(),
   /** Loopback port px0 is listening on, on the workspace's own host. */
   port: z.number().int().min(1).max(65535),
-  /** Whether it was launched with editing disabled. */
-  readOnly: z.boolean(),
-  /** The BB thread px0 sends edits to. Null for shared read-only servers. */
+  /** Whether px0's coding-harness actions are disabled. Direct edits remain available. */
+  agentDisabled: z.boolean(),
+  /** The BB thread px0 sends agent prompts to. Null for shared sessions. */
   threadId: z.string().nullable(),
+  /** Version reported by the px0 binary that owns this server. */
+  px0Version: z.string(),
   startedAt: z.number(),
 });
 
@@ -20,15 +22,16 @@ export type Px0Server = z.infer<typeof serverSchema>;
 
 export const hostContract = defineRpcContract({
   /**
-   * Start px0 on `path`, or return its existing server. Read-only servers are
-   * shared by path; editable servers are isolated by path and thread.
+   * Start px0 on `path`, or return its existing server. Sessions without the
+   * BB agent bridge are shared by path; bridged sessions are isolated by
+   * path and thread.
    */
   ensure: {
     input: z
       .object({
         path: z.string().min(1),
-        readOnly: z.boolean(),
-        /** Originating BB thread for editable sessions. */
+        agentDisabled: z.boolean(),
+        /** Originating BB thread for agent-bridged sessions. */
         threadId: z.string().min(1),
         /** Explicit binary path from settings; empty means "probe". */
         binaryPath: z.string(),
