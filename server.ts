@@ -183,7 +183,10 @@ export default async function plugin(bb: BbPluginApi) {
     const { binaryPath, readOnly: agentDisabled } = await settings.get();
     const server = await host.call(
       "ensure",
-      { path, binaryPath, agentDisabled, threadId },
+      {
+        path, binaryPath, agentDisabled, threadId,
+        frameOrigin: bb.server.experimental_appUrl ?? undefined,
+      },
       { hostId, signal },
     );
     rememberServer(hostId, server);

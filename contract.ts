@@ -35,6 +35,8 @@ export const hostContract = defineRpcContract({
         threadId: z.string().min(1),
         /** Explicit binary path from settings; empty means "probe". */
         binaryPath: z.string(),
+        /** Configured BB app origin allowed to embed this workspace. */
+        frameOrigin: z.string().url().optional(),
       })
       .strict(),
     output: serverSchema,

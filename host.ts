@@ -196,6 +196,8 @@ function exposePinnedCustomHarness(body: Buffer): Buffer {
 function startAgentUiAdapter(
   publicPort: number,
   upstreamPort: number,
+  agentDisabled: boolean,
+  frameOrigin?: string,
 ): Promise<HttpServer> {
   return new Promise((resolve, reject) => {
     const server = createHttpServer((request, response) => {
@@ -204,8 +206,9 @@ function startAgentUiAdapter(
         "http://127.0.0.1",
       ).pathname;
       const patchMetadata =
-        pathname === "/api/meta" ||
-        pathname === "/api/agent/harnesses";
+        !agentDisabled &&
+        (pathname === "/api/meta" ||
+          pathname === "/api/agent/harnesses");
       const headers = {
         ...request.headers,
         host: `127.0.0.1:${upstreamPort}`,
@@ -236,6 +239,24 @@ function startAgentUiAdapter(
           headers,
         },
         (upstreamResponse) => {
+          // px0 forbids all framing by default. Permit only BB's configured
+          // origin and its local clients, leaving every other CSP rule intact.
+          const frameSources = new Set([
+            "http://localhost:*",
+            "http://127.0.0.1:*",
+          ]);
+          if (frameOrigin) frameSources.add(new URL(frameOrigin).origin);
+          const framePolicy = `frame-ancestors ${[...frameSources].join(" ")}`;
+          const csp = upstreamResponse.headers["content-security-policy"];
+          upstreamResponse.headers["content-security-policy"] = [
+            ...(typeof csp === "string" ? csp.split(";") : []).filter(
+              (directive) =>
+                directive.trim() !== "" &&
+                !/^frame-ancestors(?:\s|$)/i.test(directive.trim()),
+            ),
+            framePolicy,
+          ].join(";");
+          delete upstreamResponse.headers["x-frame-options"];
           if (!patchMetadata) {
             response.writeHead(
               upstreamResponse.statusCode ?? 502,
@@ -321,7 +342,7 @@ function stopAll(): void {
 export default experimental_defineHostEntry({
   contract: hostContract,
   handlers: {
-    ensure: async ({ path, agentDisabled, threadId, binaryPath }, context) => {
+    ensure: async ({ path, agentDisabled, threadId, binaryPath, frameOrigin }, context) => {
       const sessionThreadId = agentDisabled ? null : threadId;
       const key = entryKey(path, sessionThreadId);
       const existing = entries.get(key);
@@ -334,9 +355,7 @@ export default experimental_defineHostEntry({
       const binary = resolveBinary(binaryPath);
       const px0Version = await checkVersion(binary);
       const upstreamPort = await pickPort();
-      const port = agentDisabled
-        ? upstreamPort
-        : await pickDifferentPort(upstreamPort);
+      const port = await pickDifferentPort(upstreamPort);
       const args = [
         "-no-open",
         "-no-update",
@@ -371,11 +390,9 @@ export default experimental_defineHostEntry({
       let adapter: HttpServer | null = null;
       const ready = waitUntilServing(upstreamPort, child, context.signal)
         .then(async () => {
-          if (!agentDisabled) {
-            adapter = await startAgentUiAdapter(port, upstreamPort);
-            const entry = entries.get(key);
-            if (entry !== undefined) entry.adapter = adapter;
-          }
+          adapter = await startAgentUiAdapter(port, upstreamPort, agentDisabled, frameOrigin);
+          const entry = entries.get(key);
+          if (entry !== undefined) entry.adapter = adapter;
         })
         .catch(
           (cause: unknown) => {

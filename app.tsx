@@ -131,7 +131,9 @@ function Px0HeaderAction({
 }
 
 export default definePluginApp((app) => {
-  app.slots.threadPanelAction({
+  app.slots.experimental_tab({
+    context: { kind: "thread" },
+    availability: "action",
     id: PANEL_ACTION_ID,
     title: "px0",
     icon: "FolderOpen",

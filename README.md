@@ -33,6 +33,10 @@ Three constraints shaped this file:
   variables, and `~/.local/bin` (where px0 installs) is often missing from it.
   The binary is probed across known install locations, with a settings
   override taking precedence.
+- **Embedding.** Every panel uses a loopback adapter because px0 0.1.20
+  sends `frame-ancestors 'none'`. The adapter preserves the rest of the CSP
+  and permits framing only by local BB clients and the configured BB app
+  origin. The agent-metadata workaround applies only to agent-enabled panels.
 - **Ports.** A free loopback port is reserved via a throwaway listener and
   handed to `-port`, then polled until px0 answers, so callers get a URL that
   is actually serving rather than one that is about to be.
@@ -59,17 +63,17 @@ editable sessions only, the host places a loopback adapter in front of px0
 that adds the pinned `bb` command to px0's two agent-metadata responses. It
 also verifies the browser's origin before rebasing agent POSTs onto px0's
 internal loopback origin; non-agent traffic streams through unchanged. This
-compatibility adapter can go away when px0 exposes pinned custom commands in
-its UI.
+metadata workaround can go away when px0 exposes pinned custom commands in
+its UI. The framing adapter is still required while px0 forbids embedding.
 
 ### `app.tsx` — the surfaces
 
-A `threadPanelAction` with `layout: "flush"` rendering the iframe, and an
+An action-available thread `experimental_tab` with `layout: "flush"` rendering the iframe, and an
 `experimental_threadHeaderAction` button that opens it.
 
 ## Notes
 
-px0 0.1.20 or newer is required. The default `readOnly` setting keeps its
+BB 0.47.1 and px0 0.1.20 or newer are required. The default `readOnly` setting keeps its
 historical key but now means "disable BB agent integration." It launches px0
 with `-no-agent`, which still leaves px0's native file editor, file creation,
 Git review, and staging controls available. Turning the setting off pins px0's
@@ -84,6 +88,7 @@ the workspace, and its native editor writes files directly.
 ```sh
 npm ci
 npm run check
+bun test host.test.ts # integration tests require px0 0.1.20+ on this host
 bb plugin install .
 bb plugin dev
 ```
